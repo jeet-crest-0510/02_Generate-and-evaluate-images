@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the main S3 bucket
+  LoggingBucketName:
+    Type: String
+    Description: Name of an EXISTING S3 bucket for storing access logs
+  Token:
+    Type: String
+    Description: The authorization token to store in Secrets Manager.
+Resources:
+
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+      ObjectLockEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucketName
+        LogFilePrefix: logs/
+
+  SecretToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: token
+      Description: The authentication token stored in AWS Secrets Manager.
+      SecretString: !Sub |
+        {
+          "token": "${Token}"
+        }
+
+  MyApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: BedrockImageGenEval
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt MyApiGateway.RootResourceId
+      PathPart: generate-image
+      RestApiId: !Ref MyApiGateway
+
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: LambdaAuthorizer
+      Type: TOKEN
+      RestApiId: !Ref MyApiGateway
+      IdentitySource: method.request.header.Authorization
+      AuthorizerUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizationLambdaFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 300
+      AuthorizerCredentials: !GetAtt ApiGatewayAuthorizerRole.Arn
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      ApiKeyRequired: false
+      HttpMethod: POST
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref MyApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionArn}/invocations
+          - LambdaFunctionArn: !GetAtt GenerateImageFunction.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      StageName: prd
+    DependsOn: ApiMethod
+
+  MyUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub ${AWS::StackName}-UsagePlan
+      Description: Usage plan for the Bedrock Image Generation API
+      ApiStages:
+        - ApiId: !Ref MyApiGateway
+          Stage: prd
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 5
+      Quota:
+        Limit: 1000
+        Period: MONTH
+    DependsOn: ApiDeployment
+
+  MyApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: API Key for the Bedrock Image Generation API
+      Enabled: true
+      GenerateDistinctId: true
+
+  MyUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref MyApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref MyUsagePlan
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GeneratePresignedUrl
+                Resource: !Sub arn:${AWS::Partition}:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  GenerateImageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      FunctionName: lambda-gen-eval-image-bedrock
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime
+          import random
+          import string
+          import os
+
+          s3_client = boto3.client('s3')
+          bedrock_client = boto3.client( service_name="bedrock-runtime", region_name="us-east-1" )
+
+          def handler(event, context):
+              body = json.loads(event['body'])
+              prompt = body['prompt']
+
+              image_base64 = generate_image_at(prompt)
+
+              image_eval = evaluate_image(prompt,image_base64)
+
+              parsed_eval = json.loads(image_eval)
+
+              # Decode the base64 image
+              image_data = base64.b64decode(image_base64)
+
+              bucket_name = os.environ['S3_BUCKET_NAME']
+
+              # Generate PreSigned URL
+              presigned_url = generate_presigned_url(bucket_name, image_data)
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'url': presigned_url,
+                      'evaluation_data': parsed_eval
+                      }),
+                  'headers': {
+                      'Content-Type': 'application/json',
+                  },
+              }
+
+          # Bedrock call to Amazon Titan Image Generator G2
+          def generate_image_at(prompt):
+
+              print("Using Amazon Titan Image Generator G2")
+
+              body = json.dumps({
+                      "taskType": "TEXT_IMAGE",
+                      "textToImageParams": {
+                          "text": prompt,
+                          "negativeText": "bad quality, low res"
+                      },
+                      "imageGenerationConfig": {
+                          "numberOfImages": 1,
+                          "height": 1280,
+                          "width": 768,
+                          "cfgScale": generate_random_double(),
+                          "seed": generate_random_int()
+                      }
+              })
+
+              model_id = 'amazon.titan-image-generator-v2:0'
+              accept = "application/json"
+              content_type = "application/json"
+
+              response = bedrock_client.invoke_model(
+                  body=body, modelId=model_id, accept=accept, contentType=content_type
+              )
+              response_body = json.loads(response.get("body").read())
+
+              finish_reason = response_body.get("error")
+
+              if finish_reason is not None:
+                  print(f"Image generation error. Error is {finish_reason}")
+
+              generated_image = response_body.get("images")[0]
+
+              return generated_image
+
+          def evaluate_image(prompt, image_base64):
+
+              body = json.dumps(
+                  {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 2048,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "type": "image",
+                                      "source": {
+                                          "type": "base64",
+                                          "media_type": "image/jpeg",
+                                          "data": image_base64
+                                      },
+                                  },
+                                  {"type": "text",
+                                  "text": ( f"Evaluate the attached image against the original prompt: {prompt}. "
+                                                              "Provide a short description of the generated image, give it score from 1 to 10, "
+                                                              "share the reason of your scoring (maximum 15 words), and suggest how the picture could better attain to the original prompt (maximum 20 words). "
+                                                              "Format your response like the following JSON structure: {{\"description\": \"x\", \"score\": \"y\", \"reason\": \"z\", \"suggestions\": \"w\"}} " )
+                                  },
+                              ],
+                          }
+                      ],
+                  }
+              )
+
+              modelId = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+              accept = "application/json"
+              contentType = "application/json"
+
+              response = bedrock_client.invoke_model(
+                  body=body, modelId=modelId, accept=accept, contentType=contentType
+              )
+
+              response_body = json.loads(response.get("body").read())
+
+              evaluation_text = response_body["content"][0]["text"]
+
+              return evaluation_text
+
+          def generate_presigned_url(bucket_name, image_data):
+              # Generate a unique object key using the current timestamp
+              object_key = f"image-gen-eval/{generate_random_string(10)}.png"
+              # Upload the image to S3
+              s3_client.put_object(Bucket=bucket_name, Key=object_key, Body=image_data, ContentType='image/png')
+              # Generate a pre-signed URL for the uploaded image
+              presigned_url = s3_client.generate_presigned_url('get_object', Params={'Bucket': bucket_name, 'Key': object_key}, ExpiresIn=3600)
+              return presigned_url
+
+          def generate_random_string(length):
+              # Define the characters to include in the random string
+              chars = string.ascii_lowercase + string.digits
+              # Generate the random string
+              random_string = ''.join(random.choice(chars) for _ in range(length))
+              return random_string
+
+          def generate_random_double(min_value=5.0, max_value=9.0):
+              return random.uniform(min_value, max_value)
+
+          def generate_random_int(min_value=1, max_value=50):
+              return random.randint(min_value, max_value)
+
+      Runtime: python3.11
+      Timeout: 240
+      MemorySize: 512
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateImageFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  LambdaAuthorizerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaAuthorizerExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaAuthorizerSecretAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SecretToken
+
+  AuthorizationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: authorization-function
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaAuthorizerExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Environment:
+        Variables:
+          SECRET_NAME: !Ref SecretToken
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              # Retrieve token from Secrets Manager
+              secret_name = os.getenv("SECRET_NAME")
+              client = boto3.client("secretsmanager")
+
+              #Retireve the token from event header "Authorization"
+              api_token = event["authorizationToken"]
+
+              try:
+                  get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+                  secret = json.loads(get_secret_value_response["SecretString"])
+                  token = secret.get("token")
+              except Exception as e:
+                  print(f"Error retrieving secret: {e}")
+                  return generatePolicy("apiCaller", "Deny", event["methodArn"])
+
+              # Authorization check
+              if token == api_token:
+                  return generatePolicy("apiCaller", "Allow", event["methodArn"])
+              else:
+                  return generatePolicy("apiCaller", "Deny", event["methodArn"])
+
+          def generatePolicy(principalId, effect, methodArn):
+              authResponse = {"principalId": principalId}
+              if effect and methodArn:
+                  policyDocument = {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Action": "execute-api:Invoke",
+                              "Effect": effect,
+                              "Resource": methodArn
+                          }
+                      ]
+                  }
+                  authResponse["policyDocument"] = policyDocument
+              return authResponse
+
+  ApiGatewayAuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayInvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AuthorizationLambdaFunction.Arn
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL for Prod stage
+    Value: !Sub https://${MyApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prd/generate-image
+  ApiId:
+    Description: ID of the API Gateway REST API
+    Value: !Ref MyApiGateway
+  ResourceId:
+    Description: ID of the API Gateway Resource
+    Value: !Ref ApiResource
