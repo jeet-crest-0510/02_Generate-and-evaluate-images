@@ -1,7 +1,7 @@
 # Blog Description
 [Generate and evaluate images in Amazon Bedrock with Amazon Titan Image Generator G1 v2 and Anthropic Claude 3.5 Sonnet](https://aws.amazon.com/blogs/machine-learning/generate-and-evaluate-images-in-amazon-bedrock-with-amazon-titan-image-generator-g1-v2-and-anthropic-claude-3-5-sonnet/)
 
-![Solution](solution.jpg)
+![Solution](1_solution.jpg)
 
 # Requirements
 ### Prerequisites for Using Amazon Bedrock with Boto3
@@ -44,4 +44,4 @@ You can build the solution architecture using **AWS CloudFormation**. A single Y
 ## OUTPUT
 Output is stored in S3 bucket.
 
-![Generated Image](GeneratedImage.png)
+![Generated Image](1_cloudform_generated_image.png)
