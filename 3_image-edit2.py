@@ -43,18 +43,18 @@ def generate_image(prompt):
 def edit_image(base64_original, edit_prompt, similarity=0.75):
     """Edits an existing image using Nova Canvas IMAGE_VARIATION."""
     payload = json.dumps({
-        "taskType": "IMAGE_VARIATION",
+        "taskType": "IMAGE_VARIATION",  # Specifies the type of task (image variation)
         "imageVariationParams": {
-            "images": [base64_original],  # Input image(s) as Base64
-            "similarityStrength": similarity,  # Controls how much variation is applied
-            "text": edit_prompt,  # Instruction for modification
-            "negativeText": "blurry, low quality, distorted"  # Prevents unwanted artifacts
+            "images": [base64_original],  # Input image(s) encoded in Base64 format
+            "similarityStrength": similarity,  # Degree of variation applied (higher = more change)
+            "text": edit_prompt,  # Instruction on how to modify the image
+            "negativeText": "blurry, low quality, distorted"  # Prevents unwanted effects
         },
         "imageGenerationConfig": {
-            "numberOfImages": 1,
-            "height": 512,
-            "width": 512,
-            "cfgScale": 7.0
+            "numberOfImages": 1,  # Specifies how many images to generate
+            "height": 512,  # Output image height
+            "width": 512,  # Output image width
+            "cfgScale": 7.0  # Controls how much the model follows the prompt (higher = more strict)
         }
     })
 
@@ -106,3 +106,16 @@ print(f"The generated image is available at: {s3_url}")
 
 s3_url = f"https://{bucket_name}.s3.amazonaws.com/{image_filename2}"
 print(f"The Edited image is available at: {s3_url}")
+
+#   Task Type                         	Description
+# "IMAGE_VARIATION"	            Generates new variations of an input image.
+# "TEXT_TO_IMAGE"	            Creates an image based on a text prompt.
+# "IMAGE_INPAINTING"	        Modifies or fills in missing parts of an image.
+# "SUPER_RESOLUTION"	        Enhances the resolution of a given image.
+# "OBJECT_REMOVAL"	            Removes unwanted objects from an image.
+# "STYLE_TRANSFER"	            Applies artistic styles to an image.
+# "IMAGE_CAPTIONING"        	Generates descriptive captions for an image.
+# "DEPTH_ESTIMATION"	        Predicts depth information from an image.
+# "SEGMENTATION"	            Identifies and segments objects in an image.
+# "FACE_SWAP"	                Replaces faces in an image with a different face.
+# "BACKGROUND_REMOVAL"      	Removes the background from an image.
