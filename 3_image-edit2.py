@@ -6,7 +6,6 @@ from PIL import Image
 
 # Initialize Amazon Bedrock client
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
-
 s3_client = boto3.client("s3")
 
 # Define the model ID
@@ -81,8 +80,8 @@ edited_image.show()  # Show edited image in VS Code
 # Define S3 bucket details
 bucket_name = "jeet-store-generated-image"
 
-image_filename1 = f"generated_images/titan_{1}.png"
-image_filename2 = f"edited_images/titan_{1}.png"
+image_filename1 = f"generated_images/generated_{1}.png"
+image_filename2 = f"edited_images/edited_{1}.png"
 
 # Upload image directly to S3
 s3_client.put_object(
